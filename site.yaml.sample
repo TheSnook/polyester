@@ -1,0 +1,46 @@
+# This is a sample config file, suitable for a fairly standard
+# WordPress site.
+
+# Name of site definition (cosmetic only)
+name: Some Site
+domains:
+    # All domains covered by this site definition.
+    - myblog.example.com
+    - www.myblog.example.com
+resources:
+  # List of different types of content that can be scraped in isolation.
+  - name: post
+    path: /archive/(?P<POST_ID>\d+)
+    follow:
+      # Posts link to tag index page (if there is a tag), but does not
+      # include the tag in metadata.
+      - /archive/tag/(?P<TAG>[^/]+)
+      - /archive/tag/(?P<TAG>[^/]+)/page/(?P<PAGE_NUM>\d+)
+    metadata:
+      - var: DATE
+        property: "article:published_time"
+      - var: CATGEORY
+        property: "article:section"
+    related:  # Other pages affected when this resource is added/changed.
+      - name: home
+        path: /
+        follow:
+          - /page/(?P<PAGE_NUM>\d+)
+      - name: feed
+        path: /feed
+        follow: []
+      - name: archive_month
+        path: /archive/{YEAR}/{MONTH}
+        follow:
+          - /archive/{YEAR}/{MONTH}/page/(?P<PAGE_NUM>\d+)
+      - name: archive_category
+        path: /archive/{CATEGORY}
+        follow:
+          - /archive/{CATEGORY}/page/(?P<PAGE_NUM>\d+)
+  - name: page
+    path: /(?P<PAGE_NAME>[^/]+)
+    follow: []
+  - name: photo
+    path: /photo/(?P<TITLE>[^/]+)
+    follow:
+      - /photo/{TITLE}/(?P<PAGE_NUM>\d+)
