@@ -1,0 +1,13 @@
+syntax = "proto3";
+package resource;
+option go_package = "github.com/TheSnook/polyester/proto/resource";
+
+message Resource {
+    bytes content = 1;
+    string content_type = 2;
+    // If set, `content` is ignored.
+    string redirect = 3;
+}
+
+// Note to self
+// Rebuild: PATH=~/go/bin/ /usr/bin/protoc --proto_path=. --go_out=. --go_opt=paths=source_relative proto/resource/resource.proto
