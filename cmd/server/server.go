@@ -1,6 +1,6 @@
 /*
  * A simple web server to serve a mix of staticated HTML from a database
- * and media files from disk.
+ * and asset files from disk.
  */
 
 package main
@@ -11,20 +11,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"go.etcd.io/bbolt"
 )
 
-var port = flag.Int("port", 8080, "TCP port to listen on.")
-var staticContent = flag.String("static_root", "/mnt/s/www/wg", "Local root of static content.")
-var dbPath = flag.String("db", "", "Database of staticated content.")
-var dbBucket = flag.String("bucket", "polyester", "BBolt bucket to read from.")
-
-// URL prefixes to serve from wp-content. Others are blocked.
+// URL prefixes to serve from assets in the filesystem. Others are blocked.
 // These should also be synced to S3 (filtered by file type if possible).
-var STATIC_PATHS = []string{
+var _DEFAULT_ASSET_PATHS = []string{
 	"images",
 	"img",
 	"moives",
@@ -38,10 +34,16 @@ var STATIC_PATHS = []string{
 	"wp-includes/js",
 }
 
-func handleStaticPaths() {
-	for _, prefix := range STATIC_PATHS {
+var port = flag.Int("port", 8080, "TCP port to listen on.")
+var assetRoot = flag.String("asset_root", "/var/www/html", "Local root of asset files.")
+var assetPaths = flag.String("asset_paths", strings.Join(_DEFAULT_ASSET_PATHS, ","), "Allowed paths under the asset root to serve assets from.")
+var dbPath = flag.String("db", "", "Database of staticated content.") // TODO: Make this a handler URI as used in polyester.go
+var dbBucket = flag.String("bucket", "polyester", "BBolt bucket to read from.")
+
+func handleAssetPaths() {
+	for _, prefix := range strings.Split(*assetPaths, ",") {
 		urlPrefix := fmt.Sprintf("/%s/", prefix)
-		localDir := fmt.Sprintf("%s/%s", *staticContent, prefix)
+		localDir := fmt.Sprintf("%s/%s", *assetRoot, prefix)
 		http.Handle(urlPrefix, http.StripPrefix(urlPrefix, http.FileServer(http.Dir(localDir))))
 	}
 }
@@ -116,18 +118,21 @@ func (b *BBoltHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Redirect(w, req, "/", http.StatusFound)
 		return
 	}
-	// Get an RLocked handle on the database.
-	db := b.db.DB()
-	defer b.db.Release()
-	err := db.View(func(tx *bbolt.Tx) error {
-		bkt := tx.Bucket([]byte(*dbBucket))
-		val := bkt.Get([]byte(path))
-		if val != nil {
-			html = make([]byte, len(val))
-			copy(html, val)
-		}
-		return nil
-	})
+
+	err := func() error {
+		// Get an RLocked handle on the database.
+		db := b.db.DB()
+		defer b.db.Release()
+		return db.View(func(tx *bbolt.Tx) error {
+			bkt := tx.Bucket([]byte(*dbBucket))
+			val := bkt.Get([]byte(path))
+			if val != nil {
+				html = make([]byte, len(val))
+				copy(html, val)
+			}
+			return nil
+		})
+	}()
 	if err != nil {
 		w.WriteHeader(500)
 		return
@@ -159,7 +164,7 @@ func main() {
 		log.Fatal("Must specify a content database to open with --db= flag.")
 	}
 	log.SetOutput(os.Stderr)
-	handleStaticPaths()
+	handleAssetPaths()
 
 	polyHandler := handlePolyesterPaths(*dbPath)
 	defer polyHandler.Close()
