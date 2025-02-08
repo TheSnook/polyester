@@ -40,6 +40,9 @@ func main() {
 		}
 	}
 
+	if *dbPath == "" {
+		log.Fatal("Flag --db is required")
+	}
 	db := storage.New(*dbPath)
 	defer db.Close()
 
@@ -69,7 +72,7 @@ func main() {
 	if *deleteResource != "" {
 		log.Fatalln("Deleting resources is not yet implemented.")
 	}
-	log.Fatalln("Nothing to do. Please specify --url or one of the --*Resouce parameters.")
+	log.Fatalln("Nothing to do. Please specify --url or one of the --<new|update|delete>_resouce parameters.")
 }
 
 func mustLoadSiteConfig(path string) *site.Config {
