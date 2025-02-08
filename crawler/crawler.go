@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -48,21 +49,13 @@ func New(origin string, db storage.Storage) Crawler {
 		db: db,
 		httpClient: &http.Client{
 			CheckRedirect: noRedirects,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // FIXME
+			},
 		},
 		origin:  origin,
 		visited: map[string]struct{}{},
 	}
-}
-
-// fetchHTML downloads from a URL and parses to HTML DOM.
-func fetchHTML(u *url.URL) (*html.Node, error) {
-	resp, err := http.Get(u.String())
-	if err != nil {
-		fmt.Printf("Error fetching URL %q: %v\n", u, err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return html.Parse(resp.Body)
 }
 
 // getURLAttr finds a named attribute of an HTML node and returns a reference to it.
@@ -131,104 +124,126 @@ func isHTMLContentType(s string) bool {
 //   - Limit returned links to defined sub-page patterns
 func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
 	links := []*url.URL{}
-	if n.Type == html.ElementNode {
-		// TODO: Prune nodes we don't want, e.g. <link rel="EditURI" ...>
-		// TODO: Deal with data-* attributes
-		switch n.DataAtom {
-		case atom.A:
-			a, u := getURLAttr(n, "href")
-			if a == nil || u == nil || !c.isLocal(u) {
-				break
-			}
-			// Follow
-			if u.Path == "" {
-				u.Path = "/"
-			}
-			oURL := *u
-			links = append(links, &oURL)
+
+	for x := range n.Descendants() {
+		links = append(links, c.staticate(x, origin)...)
+	}
+	if n.Type == html.CommentNode {
+		// This deals with conditional comments containing links (e.g. to CSS)
+		// and also obscures the original domain in regular comments.
+		n.Data = strings.Replace(n.Data, "https://"+origin+"/", "/", -1)
+		n.Data = strings.Replace(n.Data, "http://"+origin+"/", "/", -1)
+		return links
+	}
+	if n.Type != html.ElementNode {
+		return links
+	}
+	// TODO: Prune nodes we don't want, e.g. <link rel="EditURI" ...>
+	// TODO: Deal with data-* attributes
+	switch n.DataAtom {
+	case atom.A:
+		a, u := getURLAttr(n, "href")
+		if a == nil || u == nil || !c.isLocal(u) {
+			break
+		}
+		// Follow
+		if u.Path == "" {
+			u.Path = "/"
+		}
+		oURL := *u
+		links = append(links, &oURL)
+		// Relativize
+		relativize(u)
+		a.Val = u.String()
+	case atom.Img:
+		// src
+		a, u := getURLAttr(n, "src")
+		if a != nil && u != nil && c.isLocal(u) {
 			// Relativize
 			relativize(u)
 			a.Val = u.String()
-		case atom.Img:
-			// src
-			a, u := getURLAttr(n, "src")
+		}
+		// srcset
+		a = getAttr(n, "srcset")
+		if a == nil {
+			break
+		}
+		srcs := strings.Split(a.Val, ",")
+		for i, img := range srcs {
+			var src, size string
+			fmt.Sscanf(img, "%s %s", &src, &size)
+			u, err := url.Parse(src)
+			if err != nil {
+				continue
+			}
+			if c.isLocal(u) {
+				relativize(u)
+			}
+			srcs[i] = fmt.Sprintf("%s %s", u, size)
+		}
+		a.Val = strings.Join(srcs, ",")
+		// Handle data-medium-file, data-large-file, data-permalink, data-orig-file.
+		for _, d := range []string{"data-large-file", "data-medium-file", "data-orig-file", "data-permalink"} {
+			a, u := getURLAttr(n, d)
 			if a != nil && u != nil && c.isLocal(u) {
 				// Relativize
 				relativize(u)
 				a.Val = u.String()
 			}
-			// srcset
-			a = getAttr(n, "srcset")
-			if a == nil {
-				break
-			}
-			srcs := strings.Split(a.Val, ",")
-			for i, img := range srcs {
-				var src, size string
-				fmt.Sscanf(img, "%s %s", &src, &size)
-				u, err := url.Parse(src)
-				if err != nil {
-					continue
-				}
-				if c.isLocal(u) {
-					relativize(u)
-				}
-				srcs[i] = fmt.Sprintf("%s %s", u, size)
-			}
-			a.Val = strings.Join(srcs, ",")
-			// Handle data-medium-file, data-large-file, data-permalink, data-orig-file.
-			for _, d := range []string{"data-large-file", "data-medium-file", "data-orig-file", "data-permalink"} {
-				a, u := getURLAttr(n, d)
-				if a != nil && u != nil && c.isLocal(u) {
-					// Relativize
-					relativize(u)
-					a.Val = u.String()
-				}
-			}
-		case atom.Link: // href
-			a, u := getURLAttr(n, "href")
-			if a == nil || u == nil || !c.isLocal(u) {
-				break
-			}
-			if isDynamicPage(u) {
-				// Grab, but don't process or recurse into, dynamically-generated HTML-like (e.g RSS feed)
-				c.saveRaw(*u)
-			}
+		}
+	case atom.Link: // href
+		a, u := getURLAttr(n, "href")
+		if a == nil || u == nil || !c.isLocal(u) {
+			break
+		}
+		if isDynamicPage(u) {
+			// Grab, but don't process or recurse into, dynamically-generated HTML-like (e.g RSS feed)
+			c.saveRaw(*u)
+		}
+		relativize(u)
+		a.Val = u.String()
+	case atom.Script:
+		// src
+		a, u := getURLAttr(n, "src")
+		if a != nil && u != nil && c.isLocal(u) {
 			relativize(u)
 			a.Val = u.String()
-		case atom.Script:
-			// src
-			a, u := getURLAttr(n, "src")
-			if a != nil && u != nil && c.isLocal(u) {
-				relativize(u)
-				a.Val = u.String()
-				break
-			}
+			break
+		}
 
-			// Slurp up all txt nodes in the script, frobnicate, and put back.
-			var b strings.Builder
-			for x := n.FirstChild; x != nil; x = n.FirstChild {
-				b.WriteString(x.Data)
-				n.RemoveChild(x)
-			}
-			// Frobnicate select URLs.
-			js := b.String()
-			// log.Println("Frobnicating JS. In:", js)
-			for _, s := range STATIC_REPLACEMENTS {
-				pattern := `https:\/\/` + origin + s
-				js = strings.Replace(js, pattern, s, -1)
-			}
-			// log.Println("  Out:", js)
-			n.AppendChild(&html.Node{Type: html.TextNode, Data: js})
-			// TODO: Decide if there are URLs we need to extract from script for crawling, e.g. JSON data.
-		case atom.Meta:
-			// TODO: Decide if we should do something with these.
-			// a, u := getURLAttr(n, "content")
+		// Slurp up all txt nodes in the script, frobnicate, and put back.
+		var b strings.Builder
+		for x := n.FirstChild; x != nil; x = n.FirstChild {
+			b.WriteString(x.Data)
+			n.RemoveChild(x)
+		}
+		// Frobnicate select URLs.
+		js := b.String()
+		// log.Println("Frobnicating JS. In:", js)
+		for _, s := range STATIC_REPLACEMENTS {
+			pattern := `https:\/\/` + origin + s
+			js = strings.Replace(js, pattern, s, -1)
+		}
+		// log.Println("  Out:", js)
+		n.AppendChild(&html.Node{Type: html.TextNode, Data: js})
+		// TODO: Decide if there are URLs we need to extract from script for crawling, e.g. JSON data.
+	case atom.Meta:
+		// TODO: Decide if we should do something more with these.
+		a, u := getURLAttr(n, "content")
+		if a != nil && u != nil && c.isLocal(u) {
+			relativize(u)
+			a.Val = u.String()
+			break
+		}
+	case atom.Form:
+		// We "defang" these for now.
+		// TODO: Conditionally allow local <form> submits to support smart edge routing.
+		a, u := getURLAttr(n, "content")
+		if a != nil && u != nil && c.isLocal(u) {
+			a.Val = "#"
 		}
 	}
-	for x := n.FirstChild; x != nil; x = x.NextSibling {
-		links = append(links, c.staticate(x, origin)...)
-	}
+
 	return links
 }
 
@@ -256,6 +271,8 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 		return &resource.Resource{Redirect: loc}, []*url.URL{l}, nil
 	}
 
+	// Generated non-HTML resources get saved un-parsed.
+	// TODO: Handle some special content types. E.g. generated CSS with image links.
 	r := &resource.Resource{ContentType: resp.Header.Get("Content-Type")}
 	if !isHTMLContentType(r.ContentType) {
 		r.Content, err = io.ReadAll(resp.Body)
@@ -265,7 +282,7 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 	doc, err := html.Parse(resp.Body)
 
 	if err != nil {
-		log.Printf("Error fetching %q: %v\n", u, err)
+		log.Printf("Error parsing HTML from %q: %v\n", u, err)
 		return nil, nil, err
 	}
 	links := c.staticate(doc, u.Hostname())
@@ -273,6 +290,7 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 	html.Render(content, doc)
 
 	r.Content = content.Bytes()
+	// TODO: Think about whether this should preserve the original content type.
 	r.ContentType = "text/html"
 	return r, links, nil
 }
@@ -359,6 +377,8 @@ func (c *Crawler) saveRaw(u url.URL) {
 	}
 }
 
+// Crawl starts at a URL `u` and fetches up to `fetchLimit` URLs
+// found by following links in each downloaded HTML page.
 func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 	// Set up
 	startHost := u.Hostname()
@@ -388,7 +408,7 @@ func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 
 		resource, links, err := c.processURL(u)
 		if err != nil {
-			log.Printf("Error fetching %q: %v\n", u, err)
+			log.Printf("Error processing URL %q: %v\n", u, err)
 			continue
 		}
 		// Add links to crawl (start site only)

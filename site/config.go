@@ -7,7 +7,9 @@ import (
 )
 
 type Config struct {
-	Name      string
+	Name string
+	// TODO: Split into domains-to-recurse-into and domains-to-relativize-links-to
+	//       (E.g. don't recurse into the published static site, but do relativize any links to it)
 	Domains   []string
 	Resources []Resource
 }

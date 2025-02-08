@@ -10,8 +10,8 @@ domains:
 resources:
   # List of different types of content that can be scraped in isolation.
   - name: post
-    path: /archive/(?P<POST_ID>\d+)
-    follow:
+    path: /archive/(?P<POST_ID>\d+)  # Path regex of this resource type.
+    follow: 
       # Posts link to tag index page (if there is a tag), but does not
       # include the tag in metadata.
       - /archive/tag/(?P<TAG>[^/]+)
