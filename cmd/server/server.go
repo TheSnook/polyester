@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TheSnook/polyester/proto/resource"
 	"go.etcd.io/bbolt"
+	"google.golang.org/protobuf/proto"
 )
 
 // URL prefixes to serve from assets in the filesystem. Others are blocked.
@@ -105,7 +107,6 @@ func NewBBoltHandler(dbPath string) *BBoltHandler {
 
 func (b *BBoltHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Look up req.URL
-	var html []byte
 	path := req.URL.Path
 	switch path {
 	case "/statusz":
@@ -119,6 +120,7 @@ func (b *BBoltHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	var res = new(resource.Resource)
 	err := func() error {
 		// Get an RLocked handle on the database.
 		db := b.db.DB()
@@ -126,24 +128,27 @@ func (b *BBoltHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return db.View(func(tx *bbolt.Tx) error {
 			bkt := tx.Bucket([]byte(*dbBucket))
 			val := bkt.Get([]byte(path))
-			if val != nil {
-				html = make([]byte, len(val))
-				copy(html, val)
+			if val == nil {
+				log.Printf("Path %q not in db.\n", path)
+				w.WriteHeader(404)
+				return nil
 			}
-			return nil
+			return proto.Unmarshal(val, res)
 		})
 	}()
 	if err != nil {
 		w.WriteHeader(500)
 		return
 	}
-	if html == nil {
-		log.Printf("Path %q not in db.\n", path)
-		w.WriteHeader(404)
+	if location := res.GetRedirect(); location != "" {
+		w.WriteHeader(301)
+		w.Header().Add("Location", location)
+		return
 	}
-	w.Header().Set("Content-Type", "text/html")
-	if i, err := w.Write(html); i != len(html) || err != nil {
-		log.Printf("Error writing response: %d/%d bytes, %v", i, len(html), err)
+
+	w.Header().Set("Content-Type", res.GetContentType())
+	if i, err := w.Write(res.GetContent()); i != len(res.Content) || err != nil {
+		log.Printf("Error writing response: %d/%d bytes, %v", i, len(res.Content), err)
 	}
 }
 
