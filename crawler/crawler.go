@@ -88,6 +88,12 @@ func relativize(u *url.URL) {
 	u.Host = ""
 }
 
+// rootRelativeURL returns a root-relative URL string based on the passed URL
+func rootRelativeURL(u url.URL) string {
+	relativize(&u)
+	return u.String()
+}
+
 // sortQueryValues sorts the values of all multi-valued query parameters.
 func sortQueryValues(u *url.URL) {
 	q := u.Query()
@@ -102,9 +108,15 @@ func (c Crawler) isLocal(u *url.URL) bool {
 	return u.Hostname() == "" || strings.TrimPrefix(u.Hostname(), "www.") == strings.TrimPrefix(c.origin, "www.")
 }
 
+func (c Crawler) isVisited(u *url.URL) bool {
+	_, ok := c.visited[u.String()]
+	return ok
+}
+
 func isDynamicPage(u *url.URL) bool {
 	path := u.Path
-	// If there is an extension, it's a static resource
+	// If there is an extension, treat it as an asset (already static)
+	// TODO: Deal with PHP and other scripts (hidden by WordPress, but not other platforms).
 	parts := strings.Split(path, "/")
 	return !strings.Contains(parts[len(parts)-1], ".")
 }
@@ -114,29 +126,38 @@ func isHTMLContentType(s string) bool {
 	return s == "" || t == "text/html"
 }
 
-// staticate recursively parses an HTML document, excracting links to regular
+// staticateDoc recursively parses an HTML document, excracting links to regular
 // HTML documents on the origin site, and converting all URLs pointing to the
 // origin site to relative form.
 // TODO
 //   - Find everything that has a link-like value
 //   - If it's on our self-list, relativize it
 //   - Always ignore images and other media
+//   - Detect and save any dynamically-generated non-HTML where possible
 //   - Limit returned links to defined sub-page patterns
-func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
+func (c *Crawler) staticateDoc(root *html.Node, origin string) []*url.URL {
+	links := []*url.URL{}
+	links = append(links, c.staticateNode(root, origin)...)
+	for x := range root.Descendants() {
+		links = append(links, c.staticateNode(x, origin)...)
+	}
+	return links
+}
+
+// staticateDoc recursively parses an HTML document, excracting links to regular
+func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 	links := []*url.URL{}
 
-	for x := range n.Descendants() {
-		links = append(links, c.staticate(x, origin)...)
-	}
 	if n.Type == html.CommentNode {
 		// This deals with conditional comments containing links (e.g. to CSS)
 		// and also obscures the original domain in regular comments.
+		// FIXME: These might be resources we need to scrape and save.
 		n.Data = strings.Replace(n.Data, "https://"+origin+"/", "/", -1)
 		n.Data = strings.Replace(n.Data, "http://"+origin+"/", "/", -1)
-		return links
+		return nil
 	}
 	if n.Type != html.ElementNode {
-		return links
+		return nil
 	}
 	// TODO: Prune nodes we don't want, e.g. <link rel="EditURI" ...>
 	// TODO: Deal with data-* attributes
@@ -150,8 +171,11 @@ func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
 		if u.Path == "" {
 			u.Path = "/"
 		}
-		oURL := *u
-		links = append(links, &oURL)
+		if isDynamicPage(u) {
+			// Only things that don't look like static assets get crawled.
+			oURL := *u
+			links = append(links, &oURL)
+		}
 		// Relativize
 		relativize(u)
 		a.Val = u.String()
@@ -192,6 +216,7 @@ func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
 			}
 		}
 	case atom.Link: // href
+		break // FIXME
 		a, u := getURLAttr(n, "href")
 		if a == nil || u == nil || !c.isLocal(u) {
 			break
@@ -203,6 +228,7 @@ func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
 		relativize(u)
 		a.Val = u.String()
 	case atom.Script:
+		break // FIXME
 		// src
 		a, u := getURLAttr(n, "src")
 		if a != nil && u != nil && c.isLocal(u) {
@@ -228,6 +254,7 @@ func (c *Crawler) staticate(n *html.Node, origin string) []*url.URL {
 		n.AppendChild(&html.Node{Type: html.TextNode, Data: js})
 		// TODO: Decide if there are URLs we need to extract from script for crawling, e.g. JSON data.
 	case atom.Meta:
+		break // FIXME
 		// TODO: Decide if we should do something more with these.
 		a, u := getURLAttr(n, "content")
 		if a != nil && u != nil && c.isLocal(u) {
@@ -285,7 +312,7 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 		log.Printf("Error parsing HTML from %q: %v\n", u, err)
 		return nil, nil, err
 	}
-	links := c.staticate(doc, u.Hostname())
+	links := c.staticateDoc(doc, u.Hostname())
 	content := new(bytes.Buffer)
 	html.Render(content, doc)
 
@@ -301,7 +328,6 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 func (c *Crawler) followRedirects(u url.URL) (*url.URL, *http.Response) {
 	redirCount := 0
 	for {
-		relativize(&u)
 		sortQueryValues(&u)
 		if _, ok := c.visited[u.String()]; ok {
 			// Already visited
@@ -325,15 +351,19 @@ func (c *Crawler) followRedirects(u url.URL) (*url.URL, *http.Response) {
 				log.Printf("Redirect from %q to invalid url %q: %v\n", &u, l, err)
 				return nil, nil
 			}
-
-			log.Printf("Saving redirect from %q to %q\n", &u, l)
-			if err := c.db.Write(u.String(), &resource.Resource{Redirect: loc}); err != nil {
-				log.Printf("Error saving redirect from %q to %q: %v\n", &u, loc, err)
-				return nil, nil
-			}
-			if !c.isLocal(l) {
-				log.Printf("Redirect from %q to off-site url %q\n", &u, l)
-				return nil, nil
+			if c.isLocal(l) {
+				log.Printf("Saving redirect from %q to %q\n", &u, l)
+				if err := c.db.Write(rootRelativeURL(u), &resource.Resource{Redirect: rootRelativeURL(*l)}); err != nil {
+					log.Printf("Error saving redirect from %q to %q: %v\n", &u, loc, err)
+					return nil, nil
+				}
+			} else {
+				log.Printf("Saving redirect from %q to off-site url %q\n", &u, l)
+				if err := c.db.Write(rootRelativeURL(u), &resource.Resource{Redirect: loc}); err != nil {
+					log.Printf("Error saving redirect from %q to %q: %v\n", &u, loc, err)
+					return nil, nil
+				}
+				return l, nil
 			}
 			u = *l
 			redirCount++
@@ -346,10 +376,11 @@ func (c *Crawler) followRedirects(u url.URL) (*url.URL, *http.Response) {
 // saveRaw saves the contents fetched from a URL without any processing.
 // Use this for grabbing static contents of dynamically-generated non-HTML.
 func (c *Crawler) saveRaw(u url.URL) {
+	log.Printf("    Attempting to save raw content of %q.\n", &u)
 	l, resp := c.followRedirects(u)
 	if resp == nil {
 		// No content found
-		log.Printf("Got redirected to non-local content %q.\n", &u)
+		log.Printf("Could not fech non-HTML dynamic content from %q.\n", &u)
 		return
 	}
 	defer resp.Body.Close()
@@ -397,8 +428,7 @@ func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 		u := toVisit[0]
 		toVisit = toVisit[1:]
 		u.Fragment = ""
-		if _, ok := c.visited[u.String()]; ok {
-			// Already visited
+		if c.isVisited(u) {
 			continue
 		}
 		c.visited[u.String()] = struct{}{}
@@ -413,7 +443,8 @@ func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 		}
 		// Add links to crawl (start site only)
 		for _, u := range links {
-			if u.Hostname() == startHost {
+			// FIXME: should use canonical test of origin, not startHost
+			if u.Hostname() == startHost && !c.isVisited(u) {
 				toVisit = append(toVisit, u)
 			}
 		}
@@ -424,7 +455,8 @@ func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 			log.Fatalf("Could not save HTML content for %q: %v", u.Path, err)
 		}
 	}
-	log.Println("Visited:", c.visited)
+	log.Printf("Visited [%d]: %s\n", len(c.visited), c.visited)
+	log.Printf("Found but unvisited [%d]: %s\n", len(toVisit), toVisit)
 }
 
 func (c *Crawler) CrawlNewResource(u *url.URL, conf *site.Config, fetchLimit int) error {
