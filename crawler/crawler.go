@@ -165,16 +165,22 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 	case atom.A:
 		a, u := getURLAttr(n, "href")
 		if a == nil || u == nil || !c.isLocal(u) {
+			log.Printf("  Skipping invalid/non-local link %q", u)
 			break
 		}
-		// Follow
-		if u.Path == "" {
-			u.Path = "/"
+		if u.Path == "" && u.Host == "" && u.RawQuery == "" {
+			// Fragment reference to current page or empty URL. No follow.
+			log.Printf("  Skipping fragment-only link %q", u)
+			break
 		}
+
+		// Follow
 		if isDynamicPage(u) {
 			// Only things that don't look like static assets get crawled.
 			oURL := *u
 			links = append(links, &oURL)
+		} else {
+			log.Printf("  Skipping link that looks like a static asset %q", u)
 		}
 		// Relativize
 		relativize(u)
@@ -412,7 +418,6 @@ func (c *Crawler) saveRaw(u url.URL) {
 // found by following links in each downloaded HTML page.
 func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 	// Set up
-	startHost := u.Hostname()
 	if u.Path == "" {
 		u.Path = "/"
 	}
@@ -443,8 +448,7 @@ func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
 		}
 		// Add links to crawl (start site only)
 		for _, u := range links {
-			// FIXME: should use canonical test of origin, not startHost
-			if u.Hostname() == startHost && !c.isVisited(u) {
+			if c.isLocal(u) && !c.isVisited(u) {
 				toVisit = append(toVisit, u)
 			}
 		}
