@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"runtime/trace"
 
 	"github.com/TheSnook/polyester/crawler"
 	"github.com/TheSnook/polyester/site"
@@ -28,9 +29,21 @@ var updateResource = flag.String("update_resource", "", "URL of an updated resou
 var deleteResource = flag.String("delete_resource", "", "URL of a resource (page, post, etc.) to remove from the database.")
 var fetchLimit = flag.Int("limit", 1, "Max URLs to fetch.")
 
+// Development and debug flags
+var traceFile = flag.String("trace", "", "Write a Go execution trace file.")
+
 func main() {
-	flag.Parse()
 	log.SetOutput(os.Stderr)
+	flag.Parse()
+
+	if *traceFile != "" {
+		tf, err := os.OpenFile(*traceFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0664)
+		if err != nil {
+			log.Fatalf("Could not open trace file %q", *traceFile)
+		}
+		trace.Start(tf)
+		defer trace.Stop()
+	}
 
 	var siteConfig *site.Config
 	if *configFile != "" {
