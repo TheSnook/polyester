@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime/trace"
+	"strings"
 
 	"github.com/TheSnook/polyester/crawler"
 	"github.com/TheSnook/polyester/site"
@@ -24,10 +25,12 @@ var configFile = flag.String("site", "", "A YAML file defining site parameters f
 
 // Action flags
 var startURL = flag.String("url", "", "Root URL to fetch.")
+var aliasDomains = flag.String("domains", "", "Comma-separated list of domains to consider local. Origin of --url is always included.")
 var newResource = flag.String("new_resource", "", "URL of a newly-created resource (page, post, etc.) to fetch.")
 var updateResource = flag.String("update_resource", "", "URL of an updated resource (page, post, etc.) to fetch.")
 var deleteResource = flag.String("delete_resource", "", "URL of a resource (page, post, etc.) to remove from the database.")
 var fetchLimit = flag.Int("limit", 1, "Max URLs to fetch.")
+var maxParallel = flag.Int("parallel", 1, "Max concurrent fetches.")
 
 // Development and debug flags
 var traceFile = flag.String("trace", "", "Write a Go execution trace file.")
@@ -59,13 +62,24 @@ func main() {
 	db := storage.New(*dbPath)
 	defer db.Close()
 
+	aliasDomainStrings := strings.Split(*aliasDomains, ",")
+	aliases := make([]string, len(aliasDomainStrings))
+	for i, a := range aliasDomainStrings {
+		u, err := url.Parse("http://" + a + "/")
+		if err != nil {
+			log.Fatalf("Alias does not look like a valid hostname %q\n", a)
+		}
+		aliases[i] = u.Host
+	}
+
 	if *startURL != "" {
 		u, err := url.Parse(*startURL)
 		if err != nil {
 			log.Fatalf("Could not parse start url %q: %v\n", *startURL, err)
 		}
-		c := crawler.New(u.Hostname(), db)
-		c.Crawl(u, *fetchLimit)
+		c := crawler.New(u.Hostname(), aliases, db)
+		c.CrawlP(*u, *fetchLimit, *maxParallel)
+
 		return
 	}
 	if *newResource != "" {
@@ -73,7 +87,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Could not parse resource url %q: %v\n", *startURL, err)
 		}
-		c := crawler.New(u.Hostname(), db)
+		c := crawler.New(u.Hostname(), aliases, db)
 		if err := c.CrawlNewResource(u, siteConfig, *fetchLimit); err != nil {
 			log.Fatal(err)
 		}

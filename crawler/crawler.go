@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/TheSnook/polyester/proto/resource"
 	"github.com/TheSnook/polyester/site"
@@ -28,23 +29,23 @@ var STATIC_REPLACEMENTS = []string{
 	`\/wp-includes\/js\/wp-emoji-release.min.js`,
 	// jetpackSwiperLibraryPath
 	`\/wp-content\/plugins\/jetpack\/_inc\/build\/carousel\/swiper-bundle.min.js`,
-	// Don't think we need these
-	// "ajaxurl":"https:\/\/www.web-goddess.org\/wp-admin\/admin-ajax.php"
-	// "login_url":"https:\/\/www.web-goddess.org\/wp-login.php?redirect_to=https%3A%2F%2Fwww.web-goddess.org%2Farchive%2F23126"
 }
 
+// TODO: Break up this class. The Crawler, a Crawl, and the resource processing should be separated.
 type Crawler struct {
 	db         storage.Storage
 	httpClient *http.Client
 	origin     string
-	visited    map[string]struct{}
+	aliases    []string
+	seen       map[string]struct{}
+	muSeen     sync.Mutex
 }
 
 func noRedirects(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-func New(origin string, db storage.Storage) Crawler {
+func New(origin string, aliases []string, db storage.Storage) Crawler {
 	return Crawler{
 		db: db,
 		httpClient: &http.Client{
@@ -54,7 +55,8 @@ func New(origin string, db storage.Storage) Crawler {
 			},
 		},
 		origin:  origin,
-		visited: map[string]struct{}{},
+		aliases: aliases,
+		seen:    map[string]struct{}{},
 	}
 }
 
@@ -104,13 +106,21 @@ func sortQueryValues(u *url.URL) {
 	u.RawQuery = q.Encode()
 }
 
-func (c Crawler) isLocal(u *url.URL) bool {
+func (c *Crawler) isLocal(u url.URL) bool {
 	return u.Hostname() == "" || strings.TrimPrefix(u.Hostname(), "www.") == strings.TrimPrefix(c.origin, "www.")
 }
 
-func (c Crawler) isVisited(u *url.URL) bool {
-	_, ok := c.visited[u.String()]
+func (c *Crawler) isSeen(u url.URL) bool {
+	c.muSeen.Lock()
+	defer c.muSeen.Unlock()
+	_, ok := c.seen[u.String()]
 	return ok
+}
+
+func (c *Crawler) markSeen(u url.URL) {
+	c.muSeen.Lock()
+	defer c.muSeen.Unlock()
+	c.seen[u.String()] = struct{}{}
 }
 
 func isDynamicPage(u *url.URL) bool {
@@ -135,8 +145,8 @@ func isHTMLContentType(s string) bool {
 //   - Always ignore images and other media
 //   - Detect and save any dynamically-generated non-HTML where possible
 //   - Limit returned links to defined sub-page patterns
-func (c *Crawler) staticateDoc(root *html.Node, origin string) []*url.URL {
-	links := []*url.URL{}
+func (c *Crawler) staticateDoc(root *html.Node, origin string) []url.URL {
+	links := []url.URL{}
 	links = append(links, c.staticateNode(root, origin)...)
 	for x := range root.Descendants() {
 		links = append(links, c.staticateNode(x, origin)...)
@@ -145,8 +155,8 @@ func (c *Crawler) staticateDoc(root *html.Node, origin string) []*url.URL {
 }
 
 // staticateDoc recursively parses an HTML document, excracting links to regular
-func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
-	links := []*url.URL{}
+func (c *Crawler) staticateNode(n *html.Node, origin string) []url.URL {
+	links := []url.URL{}
 
 	if n.Type == html.CommentNode {
 		// This deals with conditional comments containing links (e.g. to CSS)
@@ -164,7 +174,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 	switch n.DataAtom {
 	case atom.A:
 		a, u := getURLAttr(n, "href")
-		if a == nil || u == nil || !c.isLocal(u) {
+		if a == nil || u == nil || !c.isLocal(*u) {
 			log.Printf("  Skipping invalid/non-local link %q", u)
 			break
 		}
@@ -178,7 +188,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 		if isDynamicPage(u) {
 			// Only things that don't look like static assets get crawled.
 			oURL := *u
-			links = append(links, &oURL)
+			links = append(links, oURL)
 		} else {
 			log.Printf("  Skipping link that looks like a static asset %q", u)
 		}
@@ -188,7 +198,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 	case atom.Img:
 		// src
 		a, u := getURLAttr(n, "src")
-		if a != nil && u != nil && c.isLocal(u) {
+		if a != nil && u != nil && c.isLocal(*u) {
 			// Relativize
 			relativize(u)
 			a.Val = u.String()
@@ -206,7 +216,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 			if err != nil {
 				continue
 			}
-			if c.isLocal(u) {
+			if c.isLocal(*u) {
 				relativize(u)
 			}
 			srcs[i] = fmt.Sprintf("%s %s", u, size)
@@ -215,7 +225,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 		// Handle data-medium-file, data-large-file, data-permalink, data-orig-file.
 		for _, d := range []string{"data-large-file", "data-medium-file", "data-orig-file", "data-permalink"} {
 			a, u := getURLAttr(n, d)
-			if a != nil && u != nil && c.isLocal(u) {
+			if a != nil && u != nil && c.isLocal(*u) {
 				// Relativize
 				relativize(u)
 				a.Val = u.String()
@@ -224,7 +234,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 	case atom.Link: // href
 		break // FIXME
 		a, u := getURLAttr(n, "href")
-		if a == nil || u == nil || !c.isLocal(u) {
+		if a == nil || u == nil || !c.isLocal(*u) {
 			break
 		}
 		if isDynamicPage(u) {
@@ -237,7 +247,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 		break // FIXME
 		// src
 		a, u := getURLAttr(n, "src")
-		if a != nil && u != nil && c.isLocal(u) {
+		if a != nil && u != nil && c.isLocal(*u) {
 			relativize(u)
 			a.Val = u.String()
 			break
@@ -263,7 +273,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 		break // FIXME
 		// TODO: Decide if we should do something more with these.
 		a, u := getURLAttr(n, "content")
-		if a != nil && u != nil && c.isLocal(u) {
+		if a != nil && u != nil && c.isLocal(*u) {
 			relativize(u)
 			a.Val = u.String()
 			break
@@ -272,7 +282,7 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 		// We "defang" these for now.
 		// TODO: Conditionally allow local <form> submits to support smart edge routing.
 		a, u := getURLAttr(n, "content")
-		if a != nil && u != nil && c.isLocal(u) {
+		if a != nil && u != nil && c.isLocal(*u) {
 			a.Val = "#"
 		}
 	}
@@ -282,30 +292,29 @@ func (c *Crawler) staticateNode(n *html.Node, origin string) []*url.URL {
 
 // processURL fetches, parses and staticates a URL
 // returning serialized (staticated) content and a list of further URLs to process.
-func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error) {
+func (c *Crawler) processURL(u url.URL) (*resource.Resource, []url.URL, error) {
 
 	resp, err := c.httpClient.Get(u.String())
 	if err != nil {
-		fmt.Printf("Error fetching URL %q: %v\n", u, err)
+		fmt.Printf("Error fetching URL %q: %v\n", &u, err)
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
-	// TODO: Follow multiple redirects
 	switch resp.StatusCode {
 	case 301, 302, 303, 307, 308:
 		loc := resp.Header.Get("Location")
 		l, err := url.ParseRequestURI(loc)
 		if err != nil {
-			log.Printf("Redirect from %q to invalid url %q: %v\n", u, loc, err)
+			log.Printf("Redirect from %q to invalid url %q: %v\n", &u, loc, err)
 			return nil, nil, err
 		}
-		log.Printf("Saving redirect from %q to %q\n", u, loc)
-		return &resource.Resource{Redirect: loc}, []*url.URL{l}, nil
+		log.Printf("Found redirect from %q to %q\n", &u, loc)
+		return &resource.Resource{Redirect: loc}, []url.URL{*l}, nil
 	}
 
 	// Generated non-HTML resources get saved un-parsed.
-	// TODO: Handle some special content types. E.g. generated CSS with image links.
+	// FIXME: Handle some special content types. E.g. generated CSS with image links.
 	r := &resource.Resource{ContentType: resp.Header.Get("Content-Type")}
 	if !isHTMLContentType(r.ContentType) {
 		r.Content, err = io.ReadAll(resp.Body)
@@ -313,18 +322,18 @@ func (c *Crawler) processURL(u *url.URL) (*resource.Resource, []*url.URL, error)
 	}
 
 	doc, err := html.Parse(resp.Body)
-
 	if err != nil {
-		log.Printf("Error parsing HTML from %q: %v\n", u, err)
+		log.Printf("Error parsing HTML from %q: %v\n", &u, err)
 		return nil, nil, err
 	}
+
+	// Convert the document to a static-compatible form with fully
+	// relative links, and extract links to other documents in the site.
 	links := c.staticateDoc(doc, u.Hostname())
 	content := new(bytes.Buffer)
 	html.Render(content, doc)
-
 	r.Content = content.Bytes()
-	// TODO: Think about whether this should preserve the original content type.
-	r.ContentType = "text/html"
+
 	return r, links, nil
 }
 
@@ -335,8 +344,7 @@ func (c *Crawler) followRedirects(u url.URL) (*url.URL, *http.Response) {
 	redirCount := 0
 	for {
 		sortQueryValues(&u)
-		if _, ok := c.visited[u.String()]; ok {
-			// Already visited
+		if c.isSeen(u) {
 			return nil, nil
 		}
 		resp, err := c.httpClient.Get(u.String())
@@ -357,7 +365,7 @@ func (c *Crawler) followRedirects(u url.URL) (*url.URL, *http.Response) {
 				log.Printf("Redirect from %q to invalid url %q: %v\n", &u, l, err)
 				return nil, nil
 			}
-			if c.isLocal(l) {
+			if c.isLocal(*l) {
 				log.Printf("Saving redirect from %q to %q\n", &u, l)
 				if err := c.db.Write(rootRelativeURL(u), &resource.Resource{Redirect: rootRelativeURL(*l)}); err != nil {
 					log.Printf("Error saving redirect from %q to %q: %v\n", &u, loc, err)
@@ -393,8 +401,7 @@ func (c *Crawler) saveRaw(u url.URL) {
 
 	relativize(l)
 	sortQueryValues(l)
-	if _, ok := c.visited[l.String()]; ok {
-		// Already visited
+	if c.isSeen(*l) {
 		return
 	}
 
@@ -414,53 +421,165 @@ func (c *Crawler) saveRaw(u url.URL) {
 	}
 }
 
-// Crawl starts at a URL `u` and fetches up to `fetchLimit` URLs
+// CrawlP starts at a URL `u` and fetches up to `fetchLimit` URLs
 // found by following links in each downloaded HTML page.
-func (c *Crawler) Crawl(u *url.URL, fetchLimit int) {
-	// Set up
+// Up to `maxP` page fetches are run concurrently.
+func (c *Crawler) CrawlP(u url.URL, fetchLimit int, maxP int) {
+
+	type result struct {
+		key      string             // The site-relative URL fetched.
+		resource *resource.Resource // The HTML or other content.
+		links    []url.URL          // Local (site-relative), non-static links found.
+		err      error              // Any error seen during fetching or parsing.
+	}
+
+	// The job queue
+	toDoCond := sync.NewCond(&sync.Mutex{})
+	toDo := []url.URL{}
+	// Increment any time something is added to toDo
+	// TODO: Wrap all this in a function.
+	fetched := 0
+
+	// Close this to shut down any goroutines when the craw is finished.
+	done := make(chan struct{})
+
+	// WaitGroup for pending unprocessed URLs. Incremented before URLs are
+	// added to `toDo` so that the crawl doesn't stop prematurely during a
+	// moment of idleness.
+	wg := sync.WaitGroup{}
+
+	// Results coming back from workers.
+	results := make(chan result)
+
+	// Links we found, but which exceeded fetchLimit, in string format. For tracking only.
+	extraLinks := map[string]struct{}{}
+
+	// The dispatcher takes URLs from the toDo queue and starts workers to process them.
+	// Only `maxP` workers are run concurrently.
+	dispatcher := func() {
+		// A semaphore to control the concurrecy level.
+		// TODO: Investigate whether it works better to control concurrency level
+		//       only on HTTP fetches (or have a different concurrency level for each)
+		sem := make(chan struct{}, maxP)
+		for {
+			select {
+			case <-done:
+				log.Println("Dispatcher: shutting down")
+				return
+			default:
+				toDoCond.L.Lock()
+				for len(toDo) == 0 {
+					toDoCond.Wait()
+				}
+				// There's work to do!
+				u := toDo[0]
+				toDo = toDo[1:]
+				toDoCond.L.Unlock()
+				log.Printf("Dispatcher: attempting to start worker for %q", u.String())
+				// Wait until we have enough parallel capaicty to do the work.
+				sem <- struct{}{}
+				go func(u url.URL) {
+					log.Printf("Worker: Processing %q", u.String())
+					res, links, err := c.processURL(u)
+					log.Printf("Worker: Returning results for %q", u.String())
+					results <- result{key: u.String(), resource: res, links: links, err: err}
+					log.Printf("Worker: Results for %q returned", u.String())
+					<-sem // Release semaphore
+				}(u)
+			}
+		}
+	}
+
+	// Result processor
+	resultProcessor := func() {
+		for resp := range results {
+			log.Printf("Picking up response for %q", resp.key)
+			if resp.err != nil {
+				log.Printf("Error processing URL %q: %v\n", resp.key, resp.err)
+				// TODO: Put back on the processing queue and keep a retry count to
+				//       deal with transient errors.
+				wg.Done()
+				continue
+			}
+
+			// Add any unique new URLs, up to fetchLimit
+			toDoCond.L.Lock()
+			for _, u := range resp.links {
+				// Normalize
+				if u.Path == "" {
+					u.Path = "/"
+				}
+				u.Fragment = ""
+
+				// Check if it's a viable candidate
+				if !c.isLocal(u) || c.isSeen(u) {
+					continue
+				}
+
+				// Check if we exceeded the provided limit
+				if fetched >= fetchLimit {
+					extraLinks[u.String()] = struct{}{}
+					continue
+				}
+
+				// Create a job to scrape this URL
+				wg.Add(1)
+				c.markSeen(u)
+				toDo = append(toDo, u)
+				fetched++
+			}
+			toDoCond.L.Unlock()
+			// Let the dispatcher know there is new work.
+			toDoCond.Broadcast()
+
+			// Write content to DB
+			if err := c.db.Write(resp.key, resp.resource); err != nil {
+				// TODO: Graceful error handling.
+				log.Fatalf("Could not save HTML content for %q: %v", u.Path, err)
+			}
+
+			// Mark one response as done.
+			wg.Done()
+		}
+	}
+
+	enqueueUrl := func(u url.URL) {
+		toDoCond.L.Lock()
+		wg.Add(1)
+		c.markSeen(u)
+		toDo = append(toDo, u)
+		fetched++
+		toDoCond.L.Unlock()
+		toDoCond.Signal()
+	}
+
+	// Start up our async workers
+	go dispatcher()
+	go resultProcessor()
+
+	// Start the initial fetch.
 	if u.Path == "" {
 		u.Path = "/"
 	}
-	toVisit := []*url.URL{u}
+	enqueueUrl(u)
 
-	log.Println("Beginning crawl at:", u)
+	// URLs found during the crawll cause wg.Add(1) to be called.
+	// Done() is called after processing, and only after any new URLs have been
+	// added to the queue. This prevents premature shutdown on a temporarily
+	// empty processing queue.
+	wg.Wait()
+	close(done)
+	close(results)
 
-	// Start crawling.
-	// TODO: Make this aware of site structure.
-	fetched := 0
-	for len(toVisit) > 0 && fetched < fetchLimit {
-		// Find next link
-		u := toVisit[0]
-		toVisit = toVisit[1:]
-		u.Fragment = ""
-		if c.isVisited(u) {
-			continue
-		}
-		c.visited[u.String()] = struct{}{}
-
-		fetched++
-		log.Printf("  Processing URL %d: %s\n", fetched, u)
-
-		resource, links, err := c.processURL(u)
-		if err != nil {
-			log.Printf("Error processing URL %q: %v\n", u, err)
-			continue
-		}
-		// Add links to crawl (start site only)
-		for _, u := range links {
-			if c.isLocal(u) && !c.isVisited(u) {
-				toVisit = append(toVisit, u)
-			}
-		}
-
-		// Write content to DB
-		if err := c.db.Write(u.Path, resource); err != nil {
-			// TODO: Graceful error handling.
-			log.Fatalf("Could not save HTML content for %q: %v", u.Path, err)
-		}
+	visited := make([]string, len(c.seen))
+	i := 0
+	for u := range c.seen {
+		visited[i] = u
+		i++
 	}
-	log.Printf("Visited [%d]: %s\n", len(c.visited), c.visited)
-	log.Printf("Found but unvisited [%d]: %s\n", len(toVisit), toVisit)
+
+	log.Printf("Visited [%d]: %s\n", len(visited), visited)
+	log.Printf("Found but unvisited [%d]\n", len(extraLinks))
 }
 
 func (c *Crawler) CrawlNewResource(u *url.URL, conf *site.Config, fetchLimit int) error {
